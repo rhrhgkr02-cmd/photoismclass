@@ -1,8 +1,8 @@
 /* =========================================================
    PHOTO BOOTH ✦ 선생님 모드 (admin.js)
-   - 비밀번호 입장 → 입장 코드(4자리, 3일) 만들기/종료
+   - 비밀번호 입장 → 입장 코드(4자리, 각 3일) 만들기 · 불러오기 · 삭제
    - 학생이 보낸 사진을 6초마다 자동 새로고침해서 보여줌
-   - [원본 다운로드] [바로 인쇄] [인쇄 완료 표시]
+   - [원본 다운로드] [바로 인쇄] [인쇄 완료 표시] [사진 삭제]
    ========================================================= */
 import { backend, MODE, TEST_PASSWORD, errorText } from './backend.js';
 
@@ -13,7 +13,10 @@ const PRINT_SIZE = { strip4: ['2in', '6in'], postcard: ['4in', '6in'], mini3: ['
 const POLL_MS = 6000;
 
 let ui = { show: () => {}, toast: () => {} };
-let pw = null, timer = null, filter = 'all', items = [], active = null, firstLoad = true, armed = null;
+let pw = null, timer = null, filter = 'all', items = [], codes = [], firstLoad = true, armed = null;
+let viewCode = null;      // 불러온(보고 있는) 코드. null = 가장 최근 코드
+let codeFilter = 'all';   // 'all' | '1234' : 사진 목록을 코드별로 보기
+const armTimers = {};
 const seen = new Set(), cards = new Map();
 
 const sess = {
@@ -41,7 +44,7 @@ export function enterTeacher() {
   if (!pw) pw = sess.get();
   if (!pw) { ui.show('tlogin'); return; }
   $('#tModeBadge').hidden = MODE !== 'local';
-  firstLoad = true; seen.clear();
+  firstLoad = true; seen.clear(); viewCode = null; codeFilter = 'all'; armed = null; syncFilterUI();
   refresh();
   clearInterval(timer); timer = setInterval(() => { if (!document.hidden) refresh(); }, POLL_MS);
 }
@@ -53,13 +56,13 @@ function logout() { pw = null; sess.set(null); leaveTeacher(); ui.show('home'); 
 async function refresh() {
   try {
     const j = await backend.list(pw);
-    active = j.active; items = j.items;
+    codes = j.codes || []; items = j.items;
     let fresh = 0;
     items.forEach(it => { if (!seen.has(it.id)) { seen.add(it.id); if (!firstLoad) { it._fresh = true; fresh++; } } });
     if (fresh) { ding(); ui.toast(`새 사진 ${fresh}장이 도착했어요 ✦`); }
     firstLoad = false;
     setLive('on', 'LIVE');
-    renderCode(); renderGallery();
+    if (!armed) { renderCode(); renderGallery(); }
   } catch (err) {
     if (err.code === 'WRONG_PASSWORD') { logout(); ui.toast('비밀번호가 바뀌었어요. 다시 입장해 주세요'); return; }
     setLive('off', '연결 확인 중');
@@ -67,33 +70,74 @@ async function refresh() {
 }
 function setLive(cls, text) { const l = $('#tLive'); l.className = 'live ' + cls; $('#tLiveText').textContent = text; }
 
-/* ---------- 입장 코드 ---------- */
+/* ---------- 입장 코드 (여러 개, 각 3일 보관 · 불러오기 · 삭제) ---------- */
 function remainText(ms) {
   if (ms <= 0) return '만료됨';
   const d = Math.floor(ms / 864e5), h = Math.floor(ms % 864e5 / 36e5), m = Math.floor(ms % 36e5 / 6e4);
   return d ? `${d}일 ${h}시간 남음` : h ? `${h}시간 ${m}분 남음` : `${m}분 남음`;
 }
-function renderCode() {
-  const has = !!active;
-  $('#tCode').textContent = has ? active.code : '----';
-  $('#tCode').classList.toggle('off', !has);
-  if (has) {
-    const end = new Date(active.expiresAt);
-    $('#tCodeMeta').textContent = `${remainText(active.expiresAt - Date.now())} · ${end.toLocaleString('ko-KR', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}까지`;
-  } else $('#tCodeMeta').textContent = '아직 코드가 없어요. [새 코드 만들기]를 눌러 학생들에게 알려주세요.';
-  $('#tNewCode').textContent = armed === 'new' ? '정말 바꿀까요? 한 번 더 누르기' : has ? '새 코드로 바꾸기' : '새 코드 만들기 (3일)';
-  $('#tEndCode').textContent = armed === 'end' ? '정말 종료할까요? 한 번 더 누르기' : '코드 종료';
-  $('#tEndCode').hidden = !has;
+const endText = t => new Date(t).toLocaleString('ko-KR', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const shownCode = () => codes.find(c => c.code === viewCode) || codes[0] || null;
+const photoCount = code => items.filter(it => it.code === code).length;
+
+/* 두 번 눌러야 실행 (실수 방지) */
+function armed2(key, label, el) {
+  if (armed === key) { armed = null; return true; }
+  armed = key; el.textContent = label; el.classList.add('armed');
+  clearTimeout(armTimers.t); armTimers.t = setTimeout(() => { if (armed === key) { armed = null; renderCode(); renderGallery(); } }, 3500);
+  return false;
 }
-async function codeAction(kind) {
-  // 이미 코드가 있을 때는 실수 방지를 위해 '두 번 누르기'로 확인
-  if (kind === 'end' || active) { if (armed !== kind) { armed = kind; renderCode(); setTimeout(() => { if (armed === kind) { armed = null; renderCode(); } }, 4000); return; } }
-  armed = null;
+
+function renderCode() {
+  const c = shownCode();
+  $('#tCode').textContent = c ? c.code : '----';
+  $('#tCode').classList.toggle('off', !c);
+  $('#tCodeMeta').textContent = c ? `${remainText(c.expiresAt - Date.now())} · ${endText(c.expiresAt)}까지 · 사진 ${photoCount(c.code)}장`
+    : '사용 중인 코드가 없어요. [새 코드 만들기]를 눌러 학생들에게 알려주세요.';
+  $('#tCodeTag').textContent = c && codes.length > 1 ? (c === codes[0] ? '최근 코드' : '불러온 코드') : '';
+  const list = $('#tCodeList');
+  list.innerHTML = '';
+  list.hidden = codes.length === 0;
+  codes.forEach(code => {
+    const row = document.createElement('div');
+    const on = c && c.code === code.code;
+    row.className = 'code-row' + (on ? ' on' : '');
+    row.innerHTML = `<b class="cr-code"></b><span class="cr-meta"></span>
+      <button class="btn btn-ghost cr-load" type="button"></button>
+      <button class="btn btn-ghost cr-del" type="button">삭제</button>`;
+    row.querySelector('.cr-code').textContent = code.code;
+    row.querySelector('.cr-meta').textContent = `${remainText(code.expiresAt - Date.now())} · 사진 ${photoCount(code.code)}장`;
+    const load = row.querySelector('.cr-load');
+    load.textContent = on ? '보는 중' : '불러오기'; load.disabled = on;
+    load.addEventListener('click', () => { viewCode = code.code; codeFilter = code.code; syncFilterUI(); renderCode(); renderGallery(); });
+    const del = row.querySelector('.cr-del');
+    del.addEventListener('click', () => deleteCode(code.code, del));
+    list.appendChild(row);
+  });
+  $('#tCodeListHead').hidden = codes.length === 0;
+}
+async function newCode() {
   try {
-    if (kind === 'new') { const j = await backend.createCode(pw); active = j.active; ui.toast(`새 입장 코드: ${active.code}`); }
-    else { await backend.endCode(pw); active = null; ui.toast('코드를 종료했어요. 학생들은 더 이상 보낼 수 없어요'); }
+    const j = await backend.createCode(pw);
+    codes = j.codes; viewCode = j.created.code;
+    ui.toast(`새 입장 코드: ${j.created.code} (3일 동안 사용 가능)`);
   } catch (err) { ui.toast(errorText(err)); }
   renderCode();
+}
+async function deleteCode(code, btn) {
+  if (!armed2('code:' + code, '정말 삭제?', btn)) return;
+  try {
+    const j = await backend.deleteCode(pw, code);
+    codes = j.codes;
+    if (viewCode === code) viewCode = null;
+    if (codeFilter === code) { codeFilter = 'all'; syncFilterUI(); }
+    ui.toast(`코드 ${code}를 삭제했어요. 이 코드로는 더 이상 보낼 수 없어요 (사진은 그대로 남아요)`);
+  } catch (err) { ui.toast(errorText(err)); }
+  renderCode(); renderGallery();
+}
+function syncFilterUI() {
+  $('#tCodeFilter').textContent = codeFilter === 'all' ? '모든 코드의 사진' : `코드 ${codeFilter} 사진만`;
+  $('#tShowAll').hidden = codeFilter === 'all';
 }
 
 /* ---------- 사진 목록 ---------- */
@@ -109,6 +153,7 @@ function makeCard(it) {
       <button class="btn btn-primary" data-act="download" type="button">⬇ 원본 다운로드</button>
       <button class="btn btn-ghost" data-act="print" type="button">🖨 바로 인쇄</button>
       <button class="btn btn-ghost" data-act="toggle" type="button"></button>
+      <button class="btn btn-ghost btn-del" data-act="delete" type="button">🗑 삭제</button>
     </div>`;
   const img = card.querySelector('img'), fb = card.querySelector('.img-fallback');
   img.addEventListener('error', () => { img.hidden = true; fb.hidden = false; });
@@ -116,20 +161,25 @@ function makeCard(it) {
   card.querySelector('[data-act="download"]').addEventListener('click', () => download(card._it));
   card.querySelector('[data-act="print"]').addEventListener('click', () => printPhoto(card._it));
   card.querySelector('[data-act="toggle"]').addEventListener('click', () => togglePrinted(card._it));
+  card.querySelector('[data-act="delete"]').addEventListener('click', e => deletePhoto(card._it, e.currentTarget));
   return card;
 }
 function renderGallery() {
-  const all = items.length, done = items.filter(d => d.printed).length;
+  const scope = codeFilter === 'all' ? items : items.filter(d => d.code === codeFilter);
+  const all = scope.length, done = scope.filter(d => d.printed).length;
   $('#statAll').textContent = all; $('#statDone').textContent = done; $('#statWait').textContent = all - done;
-  const list = items.filter(d => filter === 'all' || (filter === 'done' ? d.printed : !d.printed));
+  const byCode = codeFilter === 'all' ? items : items.filter(d => d.code === codeFilter);
+  const list = byCode.filter(d => filter === 'all' || (filter === 'done' ? d.printed : !d.printed));
   const g = $('#gallery'), keep = new Set();
   list.forEach(it => {
     let card = cards.get(it.id);
     if (!card) { card = makeCard(it); cards.set(it.id, card); }
     card._it = it; keep.add(it.id);
-    const no = all - items.indexOf(it);
+    const no = items.length - items.indexOf(it);
     card.querySelector('.no').textContent = '#' + String(no).padStart(3, '0');
-    card.querySelector('.lay').textContent = LAYOUT_NAME[it.layout] || '사진';
+    card.querySelector('.lay').textContent = `${LAYOUT_NAME[it.layout] || '사진'} · 코드 ${it.code || '-'}`;
+    const del = card.querySelector('[data-act="delete"]');
+    if (armed !== 'photo:' + it.id) { del.textContent = '🗑 삭제'; del.classList.remove('armed'); }
     card.querySelector('.time').textContent = fmtTime(it.created);
     card.querySelector('.printed-tag').hidden = !it.printed;
     card.querySelector('[data-act="toggle"]').textContent = it.printed ? '↺ 대기로' : '✓ 인쇄 완료';
@@ -165,6 +215,14 @@ async function togglePrinted(it) {
   catch (err) { it.printed = !next; renderGallery(); ui.toast(errorText(err)); }
 }
 
+async function deletePhoto(it, btn) {
+  if (!armed2('photo:' + it.id, '정말 삭제?', btn)) return;
+  const idx = items.indexOf(it);
+  items = items.filter(x => x !== it); renderGallery(); renderCode();            // 화면에서 먼저 지우고
+  try { await backend.deletePhoto(pw, it.id); ui.toast(MODE === 'remote' ? '사진을 삭제했어요 (드라이브 휴지통에서 30일 안에 복구 가능)' : '사진을 삭제했어요'); }
+  catch (err) { items.splice(idx, 0, it); renderGallery(); renderCode(); ui.toast(errorText(err)); }
+}
+
 /* ---------- 새 사진 알림음 ---------- */
 let ac;
 function ding() {
@@ -185,11 +243,11 @@ export function initTeacher(api) {
   $('#tLoginForm').addEventListener('submit', login);
   $('#tLoginBack').addEventListener('click', () => ui.show('home'));
   $('#tLogout').addEventListener('click', logout);
-  $('#tNewCode').addEventListener('click', () => codeAction('new'));
-  $('#tEndCode').addEventListener('click', () => codeAction('end'));
+  $('#tNewCode').addEventListener('click', newCode);
+  $('#tShowAll').addEventListener('click', () => { codeFilter = 'all'; syncFilterUI(); renderGallery(); });
   $('#tRefresh').addEventListener('click', refresh);
   $$('#tTabs button').forEach(b => b.addEventListener('click', () => {
     filter = b.dataset.filter; $$('#tTabs button').forEach(x => x.classList.toggle('on', x === b)); renderGallery();
   }));
-  setInterval(() => { if (active && document.body.dataset.screen === 'teacher') renderCode(); }, 30000);
+  setInterval(() => { if (codes.length && document.body.dataset.screen === 'teacher' && !armed) renderCode(); }, 30000);
 }

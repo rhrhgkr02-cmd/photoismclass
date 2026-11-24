@@ -112,17 +112,25 @@
       </div>
 
       <div class="card code-panel">
-        <div>
-          <p class="code-label">학생 입장 코드</p>
+        <div class="code-main">
+          <p class="code-label">학생 입장 코드 <span class="code-tag" id="tCodeTag"></span></p>
           <div class="code-digits" id="tCode">----</div>
           <p class="code-meta" id="tCodeMeta"></p>
         </div>
         <div class="code-actions">
-          <button class="btn btn-pink btn-lg" id="tNewCode" type="button">새 코드 만들기 (3일)</button>
-          <button class="btn btn-ghost" id="tEndCode" type="button" hidden>코드 종료</button>
+          <button class="btn btn-pink btn-lg" id="tNewCode" type="button">＋ 새 코드 만들기 (3일)</button>
+          <p class="code-help">코드는 여러 개 만들 수 있고, 각각 3일 동안 보관돼요.<br>반·시간대별로 코드를 나눠 써도 좋아요.</p>
+        </div>
+        <div class="code-list-wrap">
+          <p class="code-list-head" id="tCodeListHead" hidden>보관 중인 코드 · 눌러서 불러오기 / 삭제</p>
+          <div class="code-list" id="tCodeList"></div>
         </div>
       </div>
 
+      <div class="filter-line">
+        <b id="tCodeFilter">모든 코드의 사진</b>
+        <button class="text-btn" id="tShowAll" type="button" hidden>모든 코드 사진 보기</button>
+      </div>
       <div class="stats">
         <div class="stat"><small>전체</small><b id="statAll">0</b></div>
         <div class="stat"><small>인쇄 대기</small><b id="statWait">0</b></div>

@@ -31,7 +31,8 @@ const remote = {
   upload: async ({ code, blob, layout, style }) => call('upload', { code, layout, style, image: await blobToDataURL(blob) }),
   login: pw => call('login', { password: pw }),
   createCode: pw => call('createCode', { password: pw }),
-  endCode: pw => call('endCode', { password: pw }),
+  deleteCode: (pw, code) => call('deleteCode', { password: pw, code }),
+  deletePhoto: (pw, id) => call('deletePhoto', { password: pw, id }),
   async list(pw) {
     const j = await call('list', { password: pw });
     j.items.forEach(it => {
@@ -68,29 +69,44 @@ const store = {
     const db = await openDB(); if (!db) { mem.photos.set(p.id, p); return; }
     await new Promise((res, rej) => { const t = db.transaction('photos', 'readwrite'); t.objectStore('photos').put(p); t.oncomplete = res; t.onerror = () => rej(t.error); });
   },
+  async del(id) {
+    const db = await openDB(); if (!db) { mem.photos.delete(id); return; }
+    await new Promise((res, rej) => { const t = db.transaction('photos', 'readwrite'); t.objectStore('photos').delete(id); t.oncomplete = res; t.onerror = () => rej(t.error); });
+  },
   async all() {
     const db = await openDB(); if (!db) return [...mem.photos.values()];
     return new Promise((res, rej) => { const r = db.transaction('photos').objectStore('photos').getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   }
 };
 const urlCache = new Map();
-const localActive = () => { const a = ls.get('pb_test_active'); return a && Date.now() < a.expiresAt ? a : null; };
+/* 코드 여러 개를 3일씩 보관 (만료된 코드는 자동으로 사라짐) */
+const localCodes = () => {
+  const now = Date.now(), list = (ls.get('pb_test_codes') || []).filter(c => now < c.expiresAt);
+  const legacy = ls.get('pb_test_active');                       // 이전 버전 호환
+  if (legacy && now < legacy.expiresAt && !list.some(c => c.code === legacy.code)) list.push(legacy);
+  return list.sort((a, b) => b.createdAt - a.createdAt);
+};
+const saveCodes = list => { ls.set('pb_test_codes', list); ls.del('pb_test_active'); };
 const checkPw = pw => { if (pw !== TEST_PASSWORD) throw fail('WRONG_PASSWORD'); };
+const MAX_CODES = 10;
 const local = {
-  async checkCode(code) { const a = localActive(); if (!a || a.code !== String(code)) throw fail('BAD_CODE'); return { ok: true, expiresAt: a.expiresAt }; },
+  async checkCode(code) { const c = localCodes().find(c => c.code === String(code)); if (!c) throw fail('BAD_CODE'); return { ok: true, expiresAt: c.expiresAt }; },
   async upload({ code, blob, layout, style }) {
     await local.checkCode(code);
     const id = 'p' + Date.now() + Math.random().toString(36).slice(2, 6);
     await store.put({ id, blob, created: Date.now(), code: String(code), layout, style, printed: false });
     return { ok: true, id };
   },
-  async login(pw) { checkPw(pw); return { ok: true, active: localActive() }; },
+  async login(pw) { checkPw(pw); return { ok: true, codes: localCodes() }; },
   async createCode(pw) {
     checkPw(pw);
-    const a = { code: String(Math.floor(1000 + Math.random() * 9000)), createdAt: Date.now(), expiresAt: Date.now() + CODE_DAYS * 864e5 };
-    ls.set('pb_test_active', a); return { ok: true, active: a };
+    const list = localCodes();
+    if (list.length >= MAX_CODES) throw fail('TOO_MANY_CODES');
+    let code; do { code = String(Math.floor(1000 + Math.random() * 9000)); } while (list.some(c => c.code === code));
+    const c = { code, createdAt: Date.now(), expiresAt: Date.now() + CODE_DAYS * 864e5 };
+    saveCodes([c, ...list]); return { ok: true, created: c, codes: localCodes() };
   },
-  async endCode(pw) { checkPw(pw); ls.del('pb_test_active'); return { ok: true }; },
+  async deleteCode(pw, code) { checkPw(pw); saveCodes(localCodes().filter(c => c.code !== String(code))); return { ok: true, codes: localCodes() }; },
   async list(pw) {
     checkPw(pw);
     const items = (await store.all()).sort((a, b) => b.created - a.created).map(p => {
@@ -98,12 +114,17 @@ const local = {
       const u = urlCache.get(p.id);
       return { id: p.id, created: p.created, code: p.code, layout: p.layout, style: p.style, printed: p.printed, thumb: u, full: u, download: u, open: u, local: true };
     });
-    return { ok: true, active: localActive(), items };
+    return { ok: true, codes: localCodes(), items };
   },
   async setPrinted(pw, id, printed) {
     checkPw(pw);
     const p = (await store.all()).find(x => x.id === id); if (!p) throw fail('NOT_FOUND');
     p.printed = !!printed; await store.put(p); return { ok: true };
+  },
+  async deletePhoto(pw, id) {
+    checkPw(pw); await store.del(id);
+    if (urlCache.has(id)) { URL.revokeObjectURL(urlCache.get(id)); urlCache.delete(id); }
+    return { ok: true };
   }
 };
 
@@ -116,6 +137,8 @@ export function errorText(err) {
     case 'WRONG_PASSWORD': return '비밀번호가 맞지 않아요.';
     case 'NETWORK': return '인터넷 연결을 확인해 주세요. (와이파이)';
     case 'BAD_IMAGE': return '사진 파일에 문제가 있어요. 다시 시도해 주세요.';
+    case 'TOO_MANY_CODES': return '코드는 최대 10개까지 만들 수 있어요. 안 쓰는 코드를 삭제해 주세요.';
+    case 'NOT_FOUND': return '이미 삭제된 사진이에요.';
     default: return '잠시 문제가 생겼어요. 다시 시도해 주세요.';
   }
 }
